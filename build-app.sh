@@ -34,6 +34,12 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <!-- So the panel can be pointed at a dev server on localhost. -->
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>
 EOF

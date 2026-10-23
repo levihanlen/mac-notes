@@ -1,37 +1,76 @@
 import AppKit
 import Carbon.HIToolbox
+import WebKit
+
+// MacNotes is the hotkey and the floating panel. The notes themselves are /note on
+// levihanlen.com, in its list layout: the same notes as the site and the phone, synced the way
+// they sync, typed into the same way. The page keeps them in this app's own web storage, so a
+// panel that has loaded once still opens its notes with no connection.
 
 final class NotesPanel: NSPanel {
-    var onHide: (() -> Void)?
-
     override var canBecomeKey: Bool { true }
 
     override func cancelOperation(_ sender: Any?) {
-        onHide?()
         orderOut(nil)
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate,
+    WKScriptMessageHandler
+{
     private var panel: NotesPanel!
-    private var editor: NotesEditor!
-    private var textView: NotesTextView { editor.textView }
-    private var copyAllButton: IconButton!
+    private var webView: WKWebView!
     private var statusItem: NSStatusItem!
     private var hotKeyRef: EventHotKeyRef?
-    private var saveTimer: Timer?
-    private var lastSavedText = ""
-    /// False if the notes file couldn't be read or backed up, so it's never saved over.
-    private var canSave = true
+    /// Set when the page couldn't be reached, so the next time the panel opens it tries again.
+    private var loadFailed = false
 
-    private static let supportDirectory: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("MacNotes", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+    /// `defaults write com.levihanlen.macnotes URL http://localhost:3000/note` points the panel
+    /// at a dev server instead.
+    private static let notesURL: URL = {
+        if let custom = UserDefaults.standard.string(forKey: "URL"), let url = URL(string: custom) {
+            return url
+        }
+        return URL(string: "https://www.levihanlen.com/note")!
     }()
-    private let saveURL = supportDirectory.appendingPathComponent("notes.txt")
-    private let history = History(directory: supportDirectory.appendingPathComponent("history", isDirectory: true))
+
+    /// Where the notes lived before they moved to /note. Nothing reads or writes it any more;
+    /// the status menu only shows it in Finder so the old text can be copied across.
+    private static let oldNotesDirectory = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("MacNotes", isDirectory: true)
+
+    /// The list layout the first time the page opens here. After that the page's own toggle
+    /// decides, and remembers, as it does in any browser.
+    private static let seedLayout = """
+        try {
+          if (!localStorage.getItem("note-layout")) localStorage.setItem("note-layout", "list");
+        } catch (error) {}
+        """
+
+    /// Escape hides the panel, but only once the page has had it: Escape also closes the
+    /// composer, a dialog, or leaves the note being typed into, and those say so by preventing
+    /// the default. Checked after the event has finished, since the page's own listeners may run
+    /// after this one.
+    private static let escapeHides = """
+        window.addEventListener("keydown", function (event) {
+          if (event.key !== "Escape") return;
+          setTimeout(function () {
+            if (!event.defaultPrevented) window.webkit.messageHandlers.macnotes.postMessage("hide");
+          }, 0);
+        });
+        """
+
+    /// Before quitting: leaving the note being typed into writes it now rather than after the
+    /// page's short save delay, and a click elsewhere is what turns the composer's text into a
+    /// note.
+    private static let settle = """
+        (function () {
+          var active = document.activeElement;
+          if (active && active.blur) active.blur();
+          if (document.body) document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+        })();
+        """
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -41,8 +80,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         registerHotKey()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        saveAndSnapshot()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard webView != nil else { return .terminateNow }
+        webView.evaluateJavaScript(Self.settle) { _, _ in
+            // The page writes to IndexedDB asynchronously; give it a moment to land.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
     }
 
     // MARK: - Main menu
@@ -54,10 +100,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
 
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
-        let newNote = fileMenu.addItem(withTitle: "New Note", action: #selector(startNewNote), keyEquivalent: "n")
-        newNote.target = self
-        let close = fileMenu.addItem(withTitle: "Close", action: #selector(hidePanel), keyEquivalent: "w")
-        close.target = self
+        fileMenu.addItem(withTitle: "New Note", action: #selector(startNewNote), keyEquivalent: "n").target = self
+        fileMenu.addItem(withTitle: "Find", action: #selector(findNotes), keyEquivalent: "f").target = self
+        fileMenu.addItem(withTitle: "Reload", action: #selector(reloadNotes), keyEquivalent: "r").target = self
+        fileMenu.addItem(withTitle: "Close", action: #selector(hidePanel), keyEquivalent: "w").target = self
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
@@ -71,25 +117,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editMenu.addItem(.separator())
-        let copyNote = editMenu.addItem(withTitle: "Copy Note", action: #selector(copyCurrentNote), keyEquivalent: "c")
-        copyNote.keyEquivalentModifierMask = [.command, .shift]
-        copyNote.target = self
-        let copyAll = editMenu.addItem(withTitle: "Copy All Notes", action: #selector(copyAllNotes), keyEquivalent: "c")
-        copyAll.keyEquivalentModifierMask = [.command, .option]
-        copyAll.target = self
-        editMenu.addItem(.separator())
-        let findActions: [(String, String, NSEvent.ModifierFlags, NSTextFinder.Action)] = [
-            ("Find…", "f", [.command], .showFindInterface),
-            ("Find Next", "g", [.command], .nextMatch),
-            ("Find Previous", "g", [.command, .shift], .previousMatch),
-            ("Use Selection for Find", "e", [.command], .setSearchString),
-        ]
-        for (title, key, modifiers, action) in findActions {
-            let item = editMenu.addItem(withTitle: title, action: #selector(NSResponder.performTextFinderAction(_:)), keyEquivalent: key)
-            item.keyEquivalentModifierMask = modifiers
-            item.tag = action.rawValue
-        }
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
@@ -97,24 +124,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     }
 
     @objc private func hidePanel() {
-        guard panel.isVisible else { return }
-        saveAndSnapshot()
         panel.orderOut(nil)
     }
 
+    /// The page's own shortcuts: n opens the composer, / goes to search. Sent as key presses
+    /// rather than reaching into the page, so they mean whatever the page says they mean.
+    private func pressKey(_ key: String) {
+        webView.evaluateJavaScript(
+            "window.dispatchEvent(new KeyboardEvent('keydown', { key: '\(key)', bubbles: true }));"
+        )
+    }
+
     @objc private func startNewNote() {
-        textView.startNewNote()
-        panel.makeFirstResponder(textView)
+        pressKey("n")
     }
 
-    @objc private func copyCurrentNote() {
-        guard let note = textView.currentNote else { return }
-        copyToPasteboard(textView.text(of: note))
+    @objc private func findNotes() {
+        pressKey("/")
     }
 
-    @objc private func copyAllNotes() {
-        copyToPasteboard(textView.string)
-        copyAllButton.flashCheckmark()
+    @objc private func reloadNotes() {
+        loadNotes()
     }
 
     // MARK: - Panel
@@ -133,87 +163,114 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentMinSize = NSSize(width: 280, height: 160)
-        panel.onHide = { [weak self] in self?.saveAndSnapshot() }
 
-        editor = NotesEditor()
-        textView.delegate = self
-        let text = loadNotes()
-        editor.load(text)
-        lastSavedText = text
-        history.snapshot(text)
+        let content = WKUserContentController()
+        content.addUserScript(WKUserScript(source: Self.seedLayout, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        content.addUserScript(WKUserScript(source: Self.escapeHides, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        content.add(self, name: "macnotes")
 
-        panel.contentView = editor
-        setUpTitlebarButtons()
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        configuration.userContentController = content
+
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = true
+        }
+        loadNotes()
+
+        panel.contentView = webView
         panel.setFrameAutosaveName("MacNotesPanel")
         if panel.frame.origin == .zero {
             panel.center()
         }
     }
 
+    private func loadNotes() {
+        loadFailed = false
+        webView.load(URLRequest(url: Self.notesURL))
+    }
+
     @objc func togglePanel() {
         if panel.isVisible {
-            saveAndSnapshot()
             panel.orderOut(nil)
         } else {
+            if loadFailed {
+                loadNotes()
+            }
             panel.makeKeyAndOrderFront(nil)
-            panel.makeFirstResponder(textView)
+            panel.makeFirstResponder(webView)
         }
     }
 
-    private func setUpTitlebarButtons() {
-        let historyButton = IconButton(
-            symbol: "clock.arrow.circlepath", label: "History", target: self, action: #selector(showHistoryMenu(_:))
+    // MARK: - Web view
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.body as? String == "hide" {
+            panel.orderOut(nil)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        showUnreachable(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        showUnreachable(error)
+    }
+
+    private func showUnreachable(_ error: Error) {
+        // A navigation replaced by another one isn't a failure worth a page.
+        if (error as NSError).code == NSURLErrorCancelled { return }
+        loadFailed = true
+        let host = Self.notesURL.host ?? "the notes"
+        webView.loadHTMLString(
+            """
+            <body style="font: 14px -apple-system; color: #888; padding: 24px; background: transparent">
+            Couldn't reach \(host). It tries again the next time this panel opens, or press ⌘R.
+            </body>
+            """,
+            baseURL: nil
         )
-        copyAllButton = IconButton(symbol: "doc.on.doc", label: "Copy all notes", target: self, action: #selector(copyAllNotes))
-        let stack = NSStackView(views: [historyButton, copyAllButton])
-        stack.spacing = 2
-        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 6)
-        stack.frame.size = NSSize(width: stack.fittingSize.width, height: 28)
-
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.layoutAttribute = .trailing
-        accessory.view = stack
-        panel.addTitlebarAccessoryViewController(accessory)
     }
 
-    // MARK: - History menu
-
-    private static let historyDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        formatter.doesRelativeDateFormatting = true
-        return formatter
-    }()
-
-    @objc private func showHistoryMenu(_ sender: NSButton) {
-        let menu = NSMenu()
-        let snapshots = history.snapshots()
-        if snapshots.isEmpty {
-            menu.addItem(withTitle: "No history yet", action: nil, keyEquivalent: "")
+    /// The notes host, and the other apps on it reached from the page's ⌘K, open in the panel.
+    /// Anything else opens in the browser.
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else { return decisionHandler(.cancel) }
+        if url.scheme == "about" || Self.sameSite(url.host, Self.notesURL.host) {
+            return decisionHandler(.allow)
         }
-        for snapshot in snapshots.prefix(20) {
-            let item = menu.addItem(
-                withTitle: Self.historyDateFormatter.string(from: snapshot.date),
-                action: #selector(openSnapshot(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = snapshot.url
-        }
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Show All in Finder", action: #selector(showHistoryFolder), keyEquivalent: "").target = self
-        let below = sender.isFlipped ? sender.bounds.maxY + 4 : -4
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: below), in: sender)
-    }
-
-    @objc private func openSnapshot(_ sender: NSMenuItem) {
-        guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
+        decisionHandler(.cancel)
     }
 
-    @objc private func showHistoryFolder() {
-        NSWorkspace.shared.open(history.directory)
+    /// With or without the www, so a redirect between the two stays in the panel.
+    private static func sameSite(_ host: String?, _ other: String?) -> Bool {
+        func bare(_ host: String?) -> String? {
+            guard let host else { return nil }
+            return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        }
+        return bare(host) != nil && bare(host) == bare(other)
+    }
+
+    /// A link that asks for a new window goes to the browser too.
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            NSWorkspace.shared.open(url)
+        }
+        return nil
     }
 
     // MARK: - Status item
@@ -229,10 +286,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         toggle.keyEquivalentModifierMask = [.option]
         toggle.target = self
         menu.addItem(toggle)
-        menu.addItem(withTitle: "Show History in Finder", action: #selector(showHistoryFolder), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Reload Notes", action: #selector(reloadNotes), keyEquivalent: "").target = self
+        if FileManager.default.fileExists(atPath: Self.oldNotesDirectory.path) {
+            menu.addItem(withTitle: "Show Old Notes in Finder", action: #selector(showOldNotes), keyEquivalent: "").target = self
+        }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit MacNotes", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    @objc private func showOldNotes() {
+        NSWorkspace.shared.open(Self.oldNotesDirectory)
     }
 
     // MARK: - Global hotkey (⌥.)
@@ -262,61 +326,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
             0,
             &hotKeyRef
         )
-    }
-
-    // MARK: - Persistence
-
-    func textDidChange(_ notification: Notification) {
-        saveTimer?.invalidate()
-        saveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-            self?.saveNow()
-        }
-    }
-
-    private func loadNotes() -> String {
-        guard FileManager.default.fileExists(atPath: saveURL.path) else { return "" }
-        if let text = try? String(contentsOf: saveURL, encoding: .utf8) { return text }
-        var encoding = String.Encoding.utf8
-        if let text = try? String(contentsOf: saveURL, usedEncoding: &encoding) { return text }
-
-        // Unreadable: keep the original bytes before anything is saved over them.
-        let backup = history.directory.appendingPathComponent("unreadable-\(Int(Date().timeIntervalSince1970)).txt")
-        do {
-            try FileManager.default.copyItem(at: saveURL, to: backup)
-        } catch {
-            canSave = false
-            panel.title = "Notes — not saved"
-        }
-        return ""
-    }
-
-    private func saveNow() {
-        saveTimer?.invalidate()
-        saveTimer = nil
-        let text = textView.string
-        guard canSave, text != lastSavedText else { return }
-
-        // Clearing everything or deleting a big chunk puts the version before it in history.
-        if text.isEmpty || lastSavedText.utf16.count - text.utf16.count >= 100 {
-            history.snapshot(lastSavedText)
-        }
-        do {
-            try text.write(to: saveURL, atomically: true, encoding: .utf8)
-            lastSavedText = text
-            panel.title = "Notes"
-        } catch {
-            NSLog("MacNotes: couldn't save notes: \(error)")
-            panel.title = "Notes — not saved"
-        }
-        history.snapshotIfStale(text)
-    }
-
-    /// Saves and takes a history snapshot. Runs whenever the panel hides and when the app quits.
-    private func saveAndSnapshot() {
-        saveNow()
-        if canSave {
-            history.snapshot(textView.string)
-        }
     }
 }
 

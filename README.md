@@ -20,9 +20,14 @@ storage, apart from any browser's.
 - Click into a note to type into it. **Esc** leaves the note, closes the composer or a dialog,
   and otherwise hides the panel.
 - **⌘N** opens the composer for a new note. **⌘F** goes to search. **⌘R** reloads.
+- The page's own grid/list toggle works here too, and is remembered here.
 
-These go to whichever page is showing. ⌘N presses the page's own **n**, which /kb doesn't have
-yet, so on KB it does nothing; add a task from the board instead.
+These shortcuts go to whichever page is showing. ⌘N presses the page's own **n**, which /kb
+doesn't have yet, so on KB it does nothing; add a task from the board instead.
+
+Once the page has loaded, its notes are kept locally and stay readable with no connection. If
+the panel can't reach the site when it starts, it tries again the next time it opens on that
+page.
 
 ## KB
 
@@ -30,11 +35,6 @@ The KB page is [levihanlen.com/kb](https://www.levihanlen.com/kb), the task boar
 narrow one-column layout. It uses the same sync password as the notes, so once one is set up the
 other is too. **⌘F** opens its task search and **Esc** closes it (and otherwise hides the panel),
 **⌘R** reloads it. Like the notes, it stays readable with no connection once it has loaded.
-- The page's own grid/list toggle works here too, and is remembered here.
-
-Once the page has loaded, its notes are kept locally and stay readable with no connection. If
-the panel can't reach the site when it starts, it tries again the next time it opens on that
-page.
 
 ## Dev server
 

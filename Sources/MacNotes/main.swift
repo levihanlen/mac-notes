@@ -2,10 +2,10 @@ import AppKit
 import Carbon.HIToolbox
 import WebKit
 
-// MacNotes is the hotkey and the floating panel. The notes themselves are /note on
-// levihanlen.com, in its list layout: the same notes as the site and the phone, synced the way
-// they sync, typed into the same way. The page keeps them in this app's own web storage, so a
-// panel that has loaded once still opens its notes with no connection.
+// MacNotes is the hotkey and the floating panel. The panel shows one of two pages on
+// levihanlen.com: /note in its list layout, or the /kb board. Each is the same as on the site and
+// the phone, synced the way it syncs, typed into the same way. The pages keep their data in this
+// app's own web storage, so a page that has loaded once still opens with no connection.
 
 final class NotesPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -15,24 +15,57 @@ final class NotesPanel: NSPanel {
     }
 }
 
+/// The pages the panel switches between. Each has its own web view, kept alive while the other
+/// shows, so switching is instant and each keeps its scroll, its open dialog and its typing.
+enum Page: String, CaseIterable {
+    case notes
+    case kb
+
+    var title: String {
+        switch self {
+        case .notes: return "Notes"
+        case .kb: return "KB"
+        }
+    }
+
+    /// ⌘1 and ⌘2.
+    var keyEquivalent: String {
+        String(Page.allCases.firstIndex(of: self)! + 1)
+    }
+
+    /// `defaults write com.levihanlen.macnotes URL http://localhost:3000/note` points the panel
+    /// at a dev server instead. /kb is on the same origin as the notes, wherever they are.
+    var url: URL {
+        let notes: URL = {
+            if let custom = UserDefaults.standard.string(forKey: "URL"), let url = URL(string: custom) {
+                return url
+            }
+            return URL(string: "https://www.levihanlen.com/note")!
+        }()
+        switch self {
+        case .notes: return notes
+        case .kb: return URL(string: "/kb", relativeTo: notes)!.absoluteURL
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate,
     WKScriptMessageHandler
 {
     private var panel: NotesPanel!
-    private var webView: WKWebView!
+    private var webViews: [Page: WKWebView] = [:]
+    private var switcher: NSSegmentedControl!
     private var statusItem: NSStatusItem!
     private var hotKeyRef: EventHotKeyRef?
-    /// Set when the page couldn't be reached, so the next time the panel opens it tries again.
-    private var loadFailed = false
+    /// Pages that couldn't be reached, so the next time the panel opens on one it tries again.
+    private var loadFailed: Set<Page> = []
 
-    /// `defaults write com.levihanlen.macnotes URL http://localhost:3000/note` points the panel
-    /// at a dev server instead.
-    private static let notesURL: URL = {
-        if let custom = UserDefaults.standard.string(forKey: "URL"), let url = URL(string: custom) {
-            return url
-        }
-        return URL(string: "https://www.levihanlen.com/note")!
-    }()
+    /// The page showing, remembered across launches.
+    private var page: Page = Page(rawValue: UserDefaults.standard.string(forKey: "Page") ?? "") ?? .notes {
+        didSet { UserDefaults.standard.set(page.rawValue, forKey: "Page") }
+    }
+
+    private var webView: WKWebView { webViews[page]! }
 
     /// Where the notes lived before they moved to /note. Nothing reads or writes it any more;
     /// the status menu only shows it in Finder so the old text can be copied across.
@@ -40,7 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("MacNotes", isDirectory: true)
 
-    /// The list layout the first time the page opens here. After that the page's own toggle
+    /// The list layout the first time /note opens here. After that the page's own toggle
     /// decides, and remembers, as it does in any browser.
     private static let seedLayout = """
         try {
@@ -81,9 +114,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard webView != nil else { return .terminateNow }
-        webView.evaluateJavaScript(Self.settle) { _, _ in
-            // The page writes to IndexedDB asynchronously; give it a moment to land.
+        guard !webViews.isEmpty else { return .terminateNow }
+        let settled = DispatchGroup()
+        for webView in webViews.values {
+            settled.enter()
+            webView.evaluateJavaScript(Self.settle) { _, _ in settled.leave() }
+        }
+        settled.notify(queue: .main) {
+            // The pages write to IndexedDB asynchronously; give them a moment to land.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 sender.reply(toApplicationShouldTerminate: true)
             }
@@ -120,7 +158,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        for page in Page.allCases {
+            viewMenu.addItem(pageItem(page))
+        }
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
+
         NSApp.mainMenu = mainMenu
+    }
+
+    /// A menu item that shows `page`, ⌘1 or ⌘2.
+    private func pageItem(_ page: Page) -> NSMenuItem {
+        let item = NSMenuItem(title: page.title, action: #selector(showPage(_:)), keyEquivalent: page.keyEquivalent)
+        item.representedObject = page.rawValue
+        item.target = self
+        return item
     }
 
     @objc private func hidePanel() {
@@ -144,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     @objc private func reloadNotes() {
-        loadNotes()
+        load(page)
     }
 
     // MARK: - Panel
@@ -156,7 +210,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             backing: .buffered,
             defer: false
         )
-        panel.title = "Notes"
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
@@ -173,32 +226,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         configuration.websiteDataStore = .default()
         configuration.userContentController = content
 
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        if #available(macOS 13.3, *) {
-            webView.isInspectable = true
+        // Both pages load now and stay loaded, stacked, with only the current one showing.
+        let container = NSView()
+        for page in Page.allCases {
+            let webView = WKWebView(frame: container.bounds, configuration: configuration)
+            webView.autoresizingMask = [.width, .height]
+            webView.navigationDelegate = self
+            webView.uiDelegate = self
+            if #available(macOS 13.3, *) {
+                webView.isInspectable = true
+            }
+            container.addSubview(webView)
+            webViews[page] = webView
+            load(page)
         }
-        loadNotes()
+        panel.contentView = container
 
-        panel.contentView = webView
+        switcher = NSSegmentedControl(
+            labels: Page.allCases.map(\.title),
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(switchPage(_:))
+        )
+        switcher.controlSize = .small
+        switcher.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        switcher.sizeToFit()
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .right
+        let holder = NSView(frame: NSRect(x: 0, y: 0, width: switcher.frame.width + 12, height: 28))
+        switcher.frame.origin = NSPoint(x: 4, y: (holder.frame.height - switcher.frame.height) / 2)
+        holder.addSubview(switcher)
+        accessory.view = holder
+        panel.addTitlebarAccessoryViewController(accessory)
+
+        show(page)
+
         panel.setFrameAutosaveName("MacNotesPanel")
         if panel.frame.origin == .zero {
             panel.center()
         }
     }
 
-    private func loadNotes() {
-        loadFailed = false
-        webView.load(URLRequest(url: Self.notesURL))
+    private func load(_ page: Page) {
+        loadFailed.remove(page)
+        webViews[page]!.load(URLRequest(url: page.url))
+    }
+
+    /// Puts `page` in front, without opening or closing the panel.
+    private func show(_ page: Page) {
+        self.page = page
+        for (other, webView) in webViews {
+            webView.isHidden = other != page
+        }
+        panel.title = page.title
+        switcher.selectedSegment = Page.allCases.firstIndex(of: page)!
+        for item in statusItem?.menu?.items ?? [] where item.representedObject != nil {
+            item.state = item.representedObject as? String == page.rawValue ? .on : .off
+        }
+        if loadFailed.contains(page) {
+            load(page)
+        }
+        if panel.isVisible {
+            panel.makeFirstResponder(webView)
+        }
+    }
+
+    @objc private func switchPage(_ sender: NSSegmentedControl) {
+        show(Page.allCases[sender.selectedSegment])
+    }
+
+    /// From ⌘1/⌘2 or the menu bar: that page, with the panel open on it.
+    @objc private func showPage(_ sender: NSMenuItem) {
+        guard let page = Page(rawValue: sender.representedObject as? String ?? "") else { return }
+        show(page)
+        if !panel.isVisible {
+            togglePanel()
+        }
     }
 
     @objc func togglePanel() {
         if panel.isVisible {
             panel.orderOut(nil)
         } else {
-            if loadFailed {
-                loadNotes()
+            if loadFailed.contains(page) {
+                load(page)
             }
             panel.makeKeyAndOrderFront(nil)
             panel.makeFirstResponder(webView)
@@ -208,24 +319,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     // MARK: - Web view
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        if message.body as? String == "hide" {
+        if message.body as? String == "hide", message.webView == webView {
             panel.orderOut(nil)
         }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        showUnreachable(error)
+        showUnreachable(webView, error)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        showUnreachable(error)
+        showUnreachable(webView, error)
     }
 
-    private func showUnreachable(_ error: Error) {
+    private func showUnreachable(_ webView: WKWebView, _ error: Error) {
         // A navigation replaced by another one isn't a failure worth a page.
         if (error as NSError).code == NSURLErrorCancelled { return }
-        loadFailed = true
-        let host = Self.notesURL.host ?? "the notes"
+        guard let page = webViews.first(where: { $0.value == webView })?.key else { return }
+        loadFailed.insert(page)
+        let host = page.url.host ?? "the site"
         webView.loadHTMLString(
             """
             <body style="font: 14px -apple-system; color: #888; padding: 24px; background: transparent">
@@ -244,7 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         guard let url = navigationAction.request.url else { return decisionHandler(.cancel) }
-        if url.scheme == "about" || Self.sameSite(url.host, Self.notesURL.host) {
+        if url.scheme == "about" || Self.sameSite(url.host, Page.notes.url.host) {
             return decisionHandler(.allow)
         }
         NSWorkspace.shared.open(url)
@@ -282,11 +394,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             accessibilityDescription: "MacNotes"
         )
         let menu = NSMenu()
-        let toggle = NSMenuItem(title: "Show/Hide Notes", action: #selector(togglePanel), keyEquivalent: ".")
+        let toggle = NSMenuItem(title: "Show/Hide Panel", action: #selector(togglePanel), keyEquivalent: ".")
         toggle.keyEquivalentModifierMask = [.option]
         toggle.target = self
         menu.addItem(toggle)
-        menu.addItem(withTitle: "Reload Notes", action: #selector(reloadNotes), keyEquivalent: "").target = self
+        for page in Page.allCases {
+            let item = pageItem(page)
+            item.state = page == self.page ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(withTitle: "Reload", action: #selector(reloadNotes), keyEquivalent: "").target = self
         if FileManager.default.fileExists(atPath: Self.oldNotesDirectory.path) {
             menu.addItem(withTitle: "Show Old Notes in Finder", action: #selector(showOldNotes), keyEquivalent: "").target = self
         }

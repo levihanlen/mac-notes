@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Network
 import WebKit
 
 // MacNotes is the hotkey and the floating panel. The panel shows one of two pages on
@@ -8,10 +9,21 @@ import WebKit
 // app's own web storage, so a page that has loaded once still opens with no connection.
 
 final class NotesPanel: NSPanel {
+    /// When the panel was last put away. The hotkey, Esc, ⌘W and the close button all come
+    /// through `orderOut`. Starts at launch, since the panel starts hidden.
+    private(set) var hiddenAt = Date()
+
     override var canBecomeKey: Bool { true }
 
     override func cancelOperation(_ sender: Any?) {
         orderOut(nil)
+    }
+
+    override func orderOut(_ sender: Any?) {
+        if isVisible {
+            hiddenAt = Date()
+        }
+        super.orderOut(sender)
     }
 }
 
@@ -59,6 +71,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var hotKeyRef: EventHotKeyRef?
     /// Pages that couldn't be reached, so the next time the panel opens on one it tries again.
     private var loadFailed: Set<Page> = []
+    /// Whether the Mac is online, so reloading on its own never swaps a page that works offline
+    /// for one saying the site can't be reached.
+    private let network = NWPathMonitor()
+
+    /// Away this long, and opening the panel reloads both pages.
+    private static let reloadAfter: TimeInterval = 15 * 60
 
     /// The page showing, remembered across launches.
     private var page: Page = Page(rawValue: UserDefaults.standard.string(forKey: "Page") ?? "") ?? .notes {
@@ -94,9 +112,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         });
         """
 
-    /// Before quitting: leaving the note being typed into writes it now rather than after the
-    /// page's short save delay, and a click elsewhere is what turns the composer's text into a
-    /// note.
+    /// Before quitting or reloading: leaving the note being typed into writes it now rather than
+    /// after the page's short save delay, and a click elsewhere is what turns the composer's text
+    /// into a note.
     private static let settle = """
         (function () {
           var active = document.activeElement;
@@ -105,28 +123,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         })();
         """
 
+    /// What's typed into a dialog, a new task's title say, is only kept once it's saved, so
+    /// reloading on its own leaves a page with one open as it is.
+    private static let dialogOpen = """
+        document.querySelector('[role="dialog"]') !== null
+        """
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         setUpMainMenu()
         setUpPanel()
         setUpStatusItem()
         registerHotKey()
+        network.start(queue: .main)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !webViews.isEmpty else { return .terminateNow }
+        settle(Page.allCases) {
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    /// Saves what's being typed on `pages`, then calls `done` once it has had time to land.
+    private func settle(_ pages: [Page], then done: @escaping () -> Void) {
         let settled = DispatchGroup()
-        for webView in webViews.values {
+        for page in pages {
             settled.enter()
-            webView.evaluateJavaScript(Self.settle) { _, _ in settled.leave() }
+            webViews[page]!.evaluateJavaScript(Self.settle) { _, _ in settled.leave() }
         }
         settled.notify(queue: .main) {
             // The pages write to IndexedDB asynchronously; give them a moment to land.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                sender.reply(toApplicationShouldTerminate: true)
+                done()
             }
         }
-        return .terminateLater
     }
 
     // MARK: - Main menu
@@ -140,7 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let fileMenu = NSMenu(title: "File")
         fileMenu.addItem(withTitle: "New Note", action: #selector(startNewNote), keyEquivalent: "n").target = self
         fileMenu.addItem(withTitle: "Find", action: #selector(findNotes), keyEquivalent: "f").target = self
-        fileMenu.addItem(withTitle: "Reload", action: #selector(reloadNotes), keyEquivalent: "r").target = self
+        fileMenu.addItem(withTitle: "Reload", action: #selector(reloadPages), keyEquivalent: "r").target = self
         fileMenu.addItem(withTitle: "Close", action: #selector(hidePanel), keyEquivalent: "w").target = self
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
@@ -197,8 +229,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         pressKey("/")
     }
 
-    @objc private func reloadNotes() {
-        load(page)
+    /// Both pages, not only the one showing, so neither is left behind the other.
+    @objc private func reloadPages() {
+        reload(Page.allCases)
+    }
+
+    private func reload(_ pages: [Page]) {
+        settle(pages) {
+            for page in pages {
+                self.load(page)
+            }
+        }
+    }
+
+    /// Opening the panel after a while away reloads both pages, so what changed on the phone or
+    /// the site meanwhile, and any new version of the pages, is there without ⌘R. The clock
+    /// keeps running while the Mac sleeps. Only on opening, never while the panel is in use.
+    /// Returns whether it's reloading.
+    private func reloadIfAway() -> Bool {
+        guard Date().timeIntervalSince(panel.hiddenAt) >= Self.reloadAfter,
+              network.currentPath.status == .satisfied
+        else { return false }
+        for page in Page.allCases {
+            webViews[page]!.evaluateJavaScript(Self.dialogOpen) { open, _ in
+                if open as? Bool != true {
+                    self.reload([page])
+                }
+            }
+        }
+        return true
     }
 
     // MARK: - Panel
@@ -308,7 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         if panel.isVisible {
             panel.orderOut(nil)
         } else {
-            if loadFailed.contains(page) {
+            if !reloadIfAway(), loadFailed.contains(page) {
                 load(page)
             }
             panel.makeKeyAndOrderFront(nil)
@@ -403,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             item.state = page == self.page ? .on : .off
             menu.addItem(item)
         }
-        menu.addItem(withTitle: "Reload", action: #selector(reloadNotes), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Reload", action: #selector(reloadPages), keyEquivalent: "").target = self
         if FileManager.default.fileExists(atPath: Self.oldNotesDirectory.path) {
             menu.addItem(withTitle: "Show Old Notes in Finder", action: #selector(showOldNotes), keyEquivalent: "").target = self
         }

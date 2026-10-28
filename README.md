@@ -10,6 +10,12 @@ The panel shows one of two pages, switched with **Notes | KB** in its title bar,
 relaunch. Both pages stay loaded behind the switch, so switching is instant and each keeps its
 scroll, its open dialog and anything half-typed.
 
+**⌘R**, or **Reload** in the menu bar item, reloads both pages, not only the one showing. They
+also reload on their own when the panel opens after 15 minutes or more put away, time asleep
+included, so they catch up with the phone and the site without ⌘R. Not while the Mac is offline,
+so the pages stay readable, and not a page with a dialog open, so a half-typed task isn't lost.
+A note or the composer being typed into is saved first, as on quit.
+
 ## Notes
 
 The panel is [levihanlen.com/note](https://www.levihanlen.com/note) in its list layout, so it
@@ -19,7 +25,7 @@ storage, apart from any browser's.
 
 - Click into a note to type into it. **Esc** leaves the note, closes the composer or a dialog,
   and otherwise hides the panel.
-- **⌘N** opens the composer for a new note. **⌘F** goes to search. **⌘R** reloads.
+- **⌘N** opens the composer for a new note. **⌘F** goes to search.
 - The page's own grid/list toggle works here too, and is remembered here.
 
 These shortcuts go to whichever page is showing. ⌘N presses the page's own **n**, which /kb
@@ -33,8 +39,8 @@ page.
 
 The KB page is [levihanlen.com/kb](https://www.levihanlen.com/kb), the task board, in its
 narrow one-column layout. It uses the same sync password as the notes, so once one is set up the
-other is too. **⌘F** opens its task search and **Esc** closes it (and otherwise hides the panel),
-**⌘R** reloads it. Like the notes, it stays readable with no connection once it has loaded.
+other is too. **⌘F** opens its task search and **Esc** closes it (and otherwise hides the panel).
+Like the notes, it stays readable with no connection once it has loaded.
 
 ## Dev server
 

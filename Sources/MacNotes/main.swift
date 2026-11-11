@@ -7,6 +7,10 @@ import WebKit
 // levihanlen.com: /note in its list layout, or the /kb board. Each is the same as on the site and
 // the phone, synced the way it syncs, typed into the same way. The pages keep their data in this
 // app's own web storage, so a page that has loaded once still opens with no connection.
+//
+// ⌘Space opens the launcher, a second panel holding /launcher: the Mac's apps and the site's pages
+// in one field, plus "n …" for a note and "t …" for a /kb card. The page does the searching and the
+// writing; this side tells it which apps are installed and opens what it picks.
 
 final class NotesPanel: NSPanel {
     /// When the panel was last put away. The hotkey, Esc, ⌘W and the close button all come
@@ -24,6 +28,16 @@ final class NotesPanel: NSPanel {
             hiddenAt = Date()
         }
         super.orderOut(sender)
+    }
+}
+
+/// The ⌘Space window: a field and a list, high on the screen, gone the moment anything else is
+/// clicked, the way Spotlight is.
+final class LauncherPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+
+    override func cancelOperation(_ sender: Any?) {
+        orderOut(nil)
     }
 }
 
@@ -62,13 +76,22 @@ enum Page: String, CaseIterable {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate,
-    WKScriptMessageHandler
+    WKScriptMessageHandler, NSWindowDelegate
 {
     private var panel: NotesPanel!
     private var webViews: [Page: WKWebView] = [:]
     private var switcher: NSSegmentedControl!
     private var statusItem: NSStatusItem!
     private var hotKeyRef: EventHotKeyRef?
+    private var launcherHotKeyRef: EventHotKeyRef?
+    private var launcher: LauncherPanel!
+    private var launcherView: WKWebView!
+    /// When /launcher last loaded, so a long-lived copy gets the site's newer version. Reloaded
+    /// after hiding, never on opening, so opening stays instant.
+    private var launcherLoadedAt = Date()
+    private var launcherFailed = false
+    /// The installed apps as last found, sent to the page each time it opens.
+    private var installedApps: [[String: String]] = []
     /// Pages that couldn't be reached, so the next time the panel opens on one it tries again.
     private var loadFailed: Set<Page> = []
     /// Whether the Mac is online, so reloading on its own never swaps a page that works offline
@@ -77,6 +100,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     /// Away this long, and opening the panel reloads both pages.
     private static let reloadAfter: TimeInterval = 15 * 60
+    /// Loaded this long, and the launcher reloads behind the scenes once it's put away.
+    private static let launcherReloadAfter: TimeInterval = 60 * 60
+
+    /// The launcher's size. The page is laid out for nine rows under its field.
+    private static let launcherSize = NSSize(width: 640, height: 352)
 
     /// The page showing, remembered across launches.
     private var page: Page = Page(rawValue: UserDefaults.standard.string(forKey: "Page") ?? "") ?? .notes {
@@ -133,8 +161,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NSApp.setActivationPolicy(.accessory)
         setUpMainMenu()
         setUpPanel()
+        setUpLauncher()
         setUpStatusItem()
-        registerHotKey()
+        registerHotKeys()
+        refreshApps()
         network.start(queue: .main)
     }
 
@@ -378,6 +408,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     // MARK: - Web view
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "launcher" {
+            handleLauncher(message.body)
+            return
+        }
         if message.body as? String == "hide", message.webView == webView {
             panel.orderOut(nil)
         }
@@ -394,6 +428,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func showUnreachable(_ webView: WKWebView, _ error: Error) {
         // A navigation replaced by another one isn't a failure worth a page.
         if (error as NSError).code == NSURLErrorCancelled { return }
+        if webView == launcherView {
+            launcherFailed = true
+            webView.loadHTMLString(
+                """
+                <body style="font: 14px -apple-system; color: #888; padding: 24px">
+                Couldn't reach the launcher page. It tries again the next time it opens.
+                </body>
+                """,
+                baseURL: nil
+            )
+            return
+        }
         guard let page = webViews.first(where: { $0.value == webView })?.key else { return }
         loadFailed.insert(page)
         let host = page.url.host ?? "the site"
@@ -457,6 +503,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         toggle.keyEquivalentModifierMask = [.option]
         toggle.target = self
         menu.addItem(toggle)
+        let launch = NSMenuItem(title: "Show Launcher", action: #selector(toggleLauncher), keyEquivalent: " ")
+        launch.keyEquivalentModifierMask = [.command]
+        launch.target = self
+        menu.addItem(launch)
         for page in Page.allCases {
             let item = pageItem(page)
             item.state = page == self.page ? .on : .off
@@ -475,17 +525,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         NSWorkspace.shared.open(Self.oldNotesDirectory)
     }
 
-    // MARK: - Global hotkey (⌥.)
+    // MARK: - Global hotkeys (⌥. and ⌘Space)
 
-    private func registerHotKey() {
+    private static let panelHotKey: UInt32 = 1
+    private static let launcherHotKey: UInt32 = 2
+
+    private func registerHotKeys() {
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
         )
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, userData in
-                Unmanaged<AppDelegate>.fromOpaque(userData!).takeUnretainedValue().togglePanel()
+            { _, event, userData in
+                var hotKey = EventHotKeyID()
+                GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotKey
+                )
+                let delegate = Unmanaged<AppDelegate>.fromOpaque(userData!).takeUnretainedValue()
+                if hotKey.id == AppDelegate.launcherHotKey {
+                    delegate.toggleLauncher()
+                } else {
+                    delegate.togglePanel()
+                }
                 return noErr
             },
             1,
@@ -493,15 +561,209 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             Unmanaged.passUnretained(self).toOpaque(),
             nil
         )
-        let hotKeyID = EventHotKeyID(signature: OSType(0x4D4E_5453), id: 1) // "MNTS"
+        let signature = OSType(0x4D4E_5453) // "MNTS"
         RegisterEventHotKey(
             UInt32(kVK_ANSI_Period),
             UInt32(optionKey),
-            hotKeyID,
+            EventHotKeyID(signature: signature, id: Self.panelHotKey),
             GetApplicationEventTarget(),
             0,
             &hotKeyRef
         )
+        // Spotlight's own ⌘Space has to be turned off in System Settings → Keyboard → Keyboard
+        // Shortcuts → Spotlight, or it gets the keys first.
+        let status = RegisterEventHotKey(
+            UInt32(kVK_Space),
+            UInt32(cmdKey),
+            EventHotKeyID(signature: signature, id: Self.launcherHotKey),
+            GetApplicationEventTarget(),
+            0,
+            &launcherHotKeyRef
+        )
+        if status != noErr {
+            NSLog("MacNotes: couldn't take ⌘Space (\(status)); the launcher still opens from the menu bar.")
+        }
+    }
+
+    // MARK: - Launcher
+
+    private func setUpLauncher() {
+        launcher = LauncherPanel(
+            contentRect: NSRect(origin: .zero, size: Self.launcherSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        launcher.isFloatingPanel = true
+        launcher.level = .modalPanel
+        launcher.hidesOnDeactivate = false
+        launcher.isReleasedWhenClosed = false
+        launcher.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        launcher.hasShadow = true
+        launcher.delegate = self
+
+        let content = WKUserContentController()
+        content.add(self, name: "launcher")
+        let configuration = WKWebViewConfiguration()
+        // The same storage as the notes and the board, so the sync password and the notes the
+        // launcher writes into are theirs.
+        configuration.websiteDataStore = .default()
+        configuration.userContentController = content
+
+        launcherView = WKWebView(frame: NSRect(origin: .zero, size: Self.launcherSize), configuration: configuration)
+        launcherView.autoresizingMask = [.width, .height]
+        launcherView.navigationDelegate = self
+        launcherView.uiDelegate = self
+        if #available(macOS 13.3, *) {
+            launcherView.isInspectable = true
+        }
+        launcher.contentView = launcherView
+        loadLauncher()
+    }
+
+    private var launcherURL: URL {
+        URL(string: "/launcher", relativeTo: Page.notes.url)!.absoluteURL
+    }
+
+    private func loadLauncher() {
+        launcherFailed = false
+        launcherLoadedAt = Date()
+        launcherView.load(URLRequest(url: launcherURL))
+    }
+
+    @objc func toggleLauncher() {
+        if launcher.isVisible {
+            launcher.orderOut(nil)
+            return
+        }
+        if launcherFailed {
+            loadLauncher()
+        }
+        // A fifth of the way down whichever screen the pointer is on, like Spotlight.
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        if let area = screen?.visibleFrame {
+            launcher.setFrameOrigin(NSPoint(
+                x: area.midX - Self.launcherSize.width / 2,
+                y: area.maxY - area.height * 0.2 - Self.launcherSize.height
+            ))
+        }
+        launcher.makeKeyAndOrderFront(nil)
+        launcher.makeFirstResponder(launcherView)
+        sendToLauncher(opened: true)
+        refreshApps()
+    }
+
+    /// Clicking anywhere else puts it away. A copy loaded long ago reloads then, out of sight.
+    func windowDidResignKey(_ notification: Notification) {
+        guard notification.object as? LauncherPanel === launcher else { return }
+        launcher.orderOut(nil)
+        if Date().timeIntervalSince(launcherLoadedAt) >= Self.launcherReloadAfter,
+           network.currentPath.status == .satisfied
+        {
+            loadLauncher()
+        }
+    }
+
+    private func handleLauncher(_ body: Any) {
+        guard let message = body as? [String: Any], let type = message["type"] as? String else { return }
+        switch type {
+        case "ready":
+            sendToLauncher(opened: launcher.isVisible)
+        case "hide":
+            launcher.orderOut(nil)
+        case "open-app":
+            guard let path = message["path"] as? String else { return }
+            launcher.orderOut(nil)
+            NSWorkspace.shared.openApplication(
+                at: URL(fileURLWithPath: path),
+                configuration: NSWorkspace.OpenConfiguration()
+            )
+        case "open-url":
+            guard let string = message["url"] as? String, let url = URL(string: string) else { return }
+            launcher.orderOut(nil)
+            NSWorkspace.shared.open(url)
+        case "show-panel":
+            guard let page = Page(rawValue: message["page"] as? String ?? "") else { return }
+            launcher.orderOut(nil)
+            show(page)
+            if !panel.isVisible {
+                togglePanel()
+            }
+        case "captured":
+            // The panel's copy of that page catches up. Not while it's open and in use: its own
+            // sync brings the new note or card in there.
+            guard let page = Page(rawValue: message["page"] as? String ?? ""), !panel.isVisible else { return }
+            webViews[page]!.evaluateJavaScript(Self.dialogOpen) { open, _ in
+                if open as? Bool != true {
+                    self.reload([page])
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func sendToLauncher(opened: Bool) {
+        let detail: [String: Any] = ["apps": installedApps, "opened": opened]
+        guard let data = try? JSONSerialization.data(withJSONObject: detail),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        launcherView.evaluateJavaScript(
+            "window.dispatchEvent(new CustomEvent('launcher-native', { detail: \(json) }));"
+        )
+    }
+
+    /// Looks for apps off the main thread and tells the page if the list changed, so an app
+    /// installed a minute ago turns up on the next opening rather than the next launch.
+    private func refreshApps() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let found = Self.findApps()
+            DispatchQueue.main.async {
+                guard found != self.installedApps else { return }
+                self.installedApps = found
+                self.sendToLauncher(opened: false)
+            }
+        }
+    }
+
+    /// Where apps live: each folder's .app bundles, and one folder down for suites kept in a
+    /// folder of their own.
+    private static func findApps() -> [[String: String]] {
+        let files = FileManager.default
+        let home = files.homeDirectoryForCurrentUser.path
+        let folders = [
+            "/Applications",
+            "/Applications/Utilities",
+            "/System/Applications",
+            "/System/Applications/Utilities",
+            "\(home)/Applications",
+        ]
+        var paths: [String] = ["/System/Library/CoreServices/Finder.app"]
+        for folder in folders {
+            for name in (try? files.contentsOfDirectory(atPath: folder)) ?? [] {
+                let path = "\(folder)/\(name)"
+                if name.hasSuffix(".app") {
+                    paths.append(path)
+                } else if !name.hasPrefix("."), name != "Utilities",
+                          let inner = try? files.contentsOfDirectory(atPath: path)
+                {
+                    paths += inner.filter { $0.hasSuffix(".app") }.map { "\(path)/\($0)" }
+                }
+            }
+        }
+        var seen: Set<String> = []
+        var apps: [[String: String]] = []
+        for path in paths {
+            var name = files.displayName(atPath: path)
+            if name.hasSuffix(".app") {
+                name = String(name.dropLast(4))
+            }
+            // Hidden helpers (".Karabiner-VirtualHIDDevice-Manager") aren't for opening.
+            guard !name.hasPrefix("."), seen.insert(name).inserted else { continue }
+            apps.append(["name": name, "path": path])
+        }
+        return apps.sorted { $0["name"]!.localizedCaseInsensitiveCompare($1["name"]!) == .orderedAscending }
     }
 }
 

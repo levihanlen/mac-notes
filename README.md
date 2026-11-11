@@ -1,7 +1,8 @@
 # MacNotes
 
 A tiny macOS utility: press **⌥ + .** (Option + Period) anywhere to toggle a floating,
-always-on-top panel with your notes, or your KB board, in it.
+always-on-top panel with your notes, or your KB board, in it. **⌘ + Space** opens a launcher for
+apps, site pages, quick notes and kb cards.
 
 ## Notes and KB
 
@@ -42,6 +43,26 @@ narrow one-column layout. It uses the same sync password as the notes, so once o
 other is too. **⌘F** opens its task search and **Esc** closes it (and otherwise hides the panel).
 Like the notes, it stays readable with no connection once it has loaded.
 
+## Launcher (⌘Space)
+
+**⌘Space** opens a second, smaller window high on the screen: one field that finds the Mac's apps
+and the site's pages. It is [levihanlen.com/launcher](https://www.levihanlen.com/launcher), so the
+searching lives on the site and this app only says which apps are installed and opens what's
+picked.
+
+- Type a few letters, **Enter** opens the top row, **↑/↓** move. What you pick often rises to the
+  top, and with nothing typed the list is what you've opened lately.
+- Apps open as from the Dock. Site pages open in your browser, except **note** and **kb**, which
+  open this app's own panel.
+- **n buy strings** adds a note to the top of the wall; **t call dentist** adds a card to /kb
+  (short horizon, no parent). Both are pushed before the window closes. **note …** and **kb …**
+  work too.
+- **Esc**, or clicking anywhere else, puts it away. **Show Launcher** in the menu bar item opens it
+  too.
+
+Before ⌘Space works, turn off Spotlight's own shortcut: **System Settings → Keyboard → Keyboard
+Shortcuts → Spotlight → Show Spotlight search**. Spotlight is still in the menu bar.
+
 ## Dev server
 
 To point the panel at a dev server instead:
@@ -50,7 +71,8 @@ To point the panel at a dev server instead:
 defaults write com.levihanlen.macnotes URL http://localhost:3000/note
 ```
 
-KB then comes from the same origin, here `http://localhost:3000/kb`.
+KB and the launcher then come from the same origin, here `http://localhost:3000/kb` and
+`http://localhost:3000/launcher`.
 `defaults delete com.levihanlen.macnotes URL` goes back to the site.
 
 ## Old notes
@@ -72,7 +94,7 @@ then launch it once. To have it start automatically, add it in
 
 ## Details
 
-- Global hotkey uses the Carbon hotkey API — no Accessibility permission needed.
+- Global hotkeys use the Carbon hotkey API — no Accessibility permission needed.
 - The window is a non-activating floating panel: it stays on top, appears on every
   Space (including over full-screen apps), and doesn't steal focus from your current app.
 - Links to other hosts open in your browser. Right-click → Inspect Element works in the

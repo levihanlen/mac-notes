@@ -102,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private let brain = BrainSearch()
     private let clips = ClipHistory()
     private let notifier = Notifier()
+    private lazy var timers = Timers(notifier: notifier)
     /// A note or card the launcher asked the panel to open, while that page was loading or about
     /// to reload. Handed to the page once it has loaded, if that's soon.
     private var pendingItems: [Page: (id: String, at: Date)] = [:]
@@ -761,6 +762,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             // A path alone is on the site's origin.
             let url = (message["url"] as? String).flatMap { URL(string: $0, relativeTo: Page.notes.url)?.absoluteURL }
             notifier.post(title: title, body: body, url: url)
+        case "timer-start":
+            guard let id = message["id"] as? String, let endsAt = message["endsAt"] as? Double else { return }
+            let label = message["label"] as? String ?? "timer"
+            let url = (message["url"] as? String).flatMap { URL(string: $0, relativeTo: Page.notes.url)?.absoluteURL }
+            timers.start(
+                id: id,
+                label: label,
+                endsAt: Date(timeIntervalSince1970: endsAt / 1000),
+                body: message["body"] as? String ?? "time's up",
+                url: url
+            )
+        case "timer-cancel":
+            guard let id = message["id"] as? String else { return }
+            timers.cancel(id: id)
         case "request":
             answer(message)
         case "captured":
@@ -812,6 +827,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             DevGit.commit(password: password, message: message["message"] as? String ?? "") { reply($0.map { $0 }) }
         case "clips":
             reply(.success(["clips": clips.answer]))
+        case "timers":
+            reply(.success(["timers": timers.answer]))
         case let kind:
             reply(.failure(LauncherError("MacNotes doesn't know \(kind ?? "that")")))
         }

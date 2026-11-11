@@ -76,6 +76,11 @@ The page also asks this app for what only the Mac has:
   the middle.
 - **Notifications.** Clicking one opens its link. macOS asks to allow them the first time.
 
+- **Timers.** **timer 10m tea** (or 1h30m, 90s, a bare 25 for minutes) hands macOS a
+  notification for when it's up, so it comes even if MacNotes has quit. **timer** and a space
+  lists the ones running; Enter on one cancels it. **f 45 essay** starts a /focus session in the
+  browser and a timer for its end.
+
 ### Clipboard History
 
 This app keeps the last 200 texts you copy, newest first, so the launcher can list them and put one

@@ -40,6 +40,35 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// A notification macOS shows at `at` by itself, so it comes even if MacNotes has quit or the
+    /// Mac was asleep in between. `id` is how it's cancelled.
+    func schedule(id: String, title: String, body: String, at: Date, url: URL?) {
+        guard let center else {
+            NSLog("MacNotes: notifications need MacNotes.app; skipped \"\(title)\"")
+            return
+        }
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            if let url {
+                content.userInfo = ["url": url.absoluteString]
+            }
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, at.timeIntervalSinceNow), repeats: false)
+            center.add(UNNotificationRequest(identifier: id, content: content, trigger: trigger)) { error in
+                if let error {
+                    NSLog("MacNotes: couldn't schedule a notification: \(error)")
+                }
+            }
+        }
+    }
+
+    func cancel(id: String) {
+        center?.removePendingNotificationRequests(withIdentifiers: [id])
+    }
+
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,

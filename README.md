@@ -63,6 +63,32 @@ picked.
 Before ⌘Space works, turn off Spotlight's own shortcut: **System Settings → Keyboard → Keyboard
 Shortcuts → Spotlight → Show Spotlight search**. Spotlight is still in the menu bar.
 
+The page also asks this app for what only the Mac has:
+
+- **brain/ search.** Notes in `~/Documents/GitHub/life-nextjs/brain` are searched on disk: a note
+  matches when every word is in its path or its text, and notes named for the words come first.
+  For a checkout somewhere else:
+  `defaults write com.levihanlen.macnotes BrainPath ~/somewhere/brain`.
+- **Commit.** Status, commit, pull and push go to the dev server's /git API on
+  `http://localhost:3000` (or the `URL` default's origin, when that's a localhost one). The dev
+  server has to be running.
+- **Windows.** Moves the front app's window to a half, a third, two thirds, the whole screen, or
+  the middle.
+- **Notifications.** Clicking one opens its link. macOS asks to allow them the first time.
+
+### Clipboard History
+
+This app keeps the last 200 texts you copy, newest first, so the launcher can list them and put one
+back. Copying the same text again moves it to the top. Text only, and nothing a password manager
+marks as private. It lives in `~/Library/Application Support/MacNotes/clips.json`, readable only by
+you, and is never sent anywhere. Delete the file to clear it.
+
+Picking a clip puts it back on the clipboard and pastes it into the app you were in. Pasting and
+moving windows press keys and move windows in other apps, so they need **System Settings → Privacy
+& Security → Accessibility → MacNotes**; macOS prompts for it the first time. Without it, a picked
+clip is only put back on the clipboard for **⌘V**, and windows don't move. Each `./build-app.sh`
+makes a new signature, so after a rebuild remove MacNotes from that list (**−**) and add it again.
+
 ## Dev server
 
 To point the panel at a dev server instead:
@@ -94,7 +120,8 @@ then launch it once. To have it start automatically, add it in
 
 ## Details
 
-- Global hotkeys use the Carbon hotkey API — no Accessibility permission needed.
+- Global hotkeys use the Carbon hotkey API, so they need no permission. Only pasting a clip and
+  moving windows need Accessibility.
 - The window is a non-activating floating panel: it stays on top, appears on every
   Space (including over full-screen apps), and doesn't steal focus from your current app.
 - Links to other hosts open in your browser. Right-click → Inspect Element works in the

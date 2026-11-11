@@ -10,7 +10,9 @@ import WebKit
 //
 // ⌘Space opens the launcher, a second panel holding /launcher: the Mac's apps and the site's pages
 // in one field, plus "n …" for a note and "t …" for a /kb card. The page does the searching and the
-// writing; this side tells it which apps are installed and opens what it picks.
+// writing; this side tells it which apps are installed and opens what it picks, and does what a
+// web page can't: searching brain/ on disk, asking the dev server's git, keeping the clipboard's
+// history, pasting into and moving the windows of the app in front, and posting notifications.
 
 final class NotesPanel: NSPanel {
     /// When the panel was last put away. The hotkey, Esc, ⌘W and the close button all come
@@ -97,11 +99,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     /// Whether the Mac is online, so reloading on its own never swaps a page that works offline
     /// for one saying the site can't be reached.
     private let network = NWPathMonitor()
+    private let brain = BrainSearch()
+    private let clips = ClipHistory()
+    private let notifier = Notifier()
+    /// A note or card the launcher asked the panel to open, while that page was loading or about
+    /// to reload. Handed to the page once it has loaded, if that's soon.
+    private var pendingItems: [Page: (id: String, at: Date)] = [:]
 
     /// Away this long, and opening the panel reloads both pages.
     private static let reloadAfter: TimeInterval = 15 * 60
     /// Loaded this long, and the launcher reloads behind the scenes once it's put away.
     private static let launcherReloadAfter: TimeInterval = 60 * 60
+
+    /// How long an item asked for while its page reloads still opens once it has.
+    private static let pendingItemFor: TimeInterval = 15
 
     /// The launcher's size. The page is laid out for nine rows under its field.
     private static let launcherSize = NSSize(width: 640, height: 352)
@@ -166,6 +177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         registerHotKeys()
         refreshApps()
         network.start(queue: .main)
+        clips.start()
+        notifier.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -417,6 +430,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
     }
 
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let page = webViews.first(where: { $0.value == webView })?.key,
+              let pending = pendingItems.removeValue(forKey: page),
+              Date().timeIntervalSince(pending.at) < Self.pendingItemFor
+        else { return }
+        // The load event can come before the page's own listeners are on; a moment for them.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.openItem(pending.id, on: page)
+        }
+    }
+
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         showUnreachable(webView, error)
     }
@@ -513,12 +537,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             menu.addItem(item)
         }
         menu.addItem(withTitle: "Reload", action: #selector(reloadPages), keyEquivalent: "").target = self
-        if FileManager.default.fileExists(atPath: Self.oldNotesDirectory.path) {
+        if Self.hasOldNotes {
             menu.addItem(withTitle: "Show Old Notes in Finder", action: #selector(showOldNotes), keyEquivalent: "").target = self
         }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit MacNotes", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    /// The folder now also holds the clipboard history, so it's the old notes in it that count.
+    private static var hasOldNotes: Bool {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: oldNotesDirectory.path)) ?? []
+        return names.contains { $0 != ClipHistory.fileName && !$0.hasPrefix(".") }
     }
 
     @objc private func showOldNotes() {
@@ -690,6 +720,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             if !panel.isVisible {
                 togglePanel()
             }
+        case "open-item":
+            guard let page = Page(rawValue: message["page"] as? String ?? ""),
+                  let id = message["id"] as? String
+            else { return }
+            launcher.orderOut(nil)
+            show(page)
+            if !panel.isVisible {
+                togglePanel()
+            }
+            // Now, and again once the page has loaded in case opening the panel reloads it.
+            pendingItems[page] = (id, Date())
+            if !webViews[page]!.isLoading {
+                openItem(id, on: page)
+            }
+        case "copy":
+            guard let text = message["text"] as? String else { return }
+            putOnClipboard(text)
+            launcher.orderOut(nil)
+        case "paste":
+            guard let text = message["text"] as? String else { return }
+            putOnClipboard(text)
+            launcher.orderOut(nil)
+            // Without Accessibility it stays on the clipboard, for ⌘V by hand.
+            if Accessibility.trusted() {
+                // A moment for the keyboard to go back to the app in front.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    Accessibility.pressPaste()
+                }
+            }
+        case "window":
+            guard let spot = message["spot"] as? String else { return }
+            launcher.orderOut(nil)
+            if Accessibility.trusted() {
+                Accessibility.move(to: spot)
+            }
+        case "notify":
+            let title = message["title"] as? String ?? ""
+            let body = message["body"] as? String ?? ""
+            // A path alone is on the site's origin.
+            let url = (message["url"] as? String).flatMap { URL(string: $0, relativeTo: Page.notes.url)?.absoluteURL }
+            notifier.post(title: title, body: body, url: url)
+        case "request":
+            answer(message)
         case "captured":
             // The panel's copy of that page catches up. Not while it's open and in use: its own
             // sync brings the new note or card in there.
@@ -702,6 +775,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         default:
             break
         }
+    }
+
+    private func putOnClipboard(_ text: String) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+    }
+
+    /// Hands the page the note or card the launcher found, by id. The page listens for this.
+    private func openItem(_ id: String, on page: Page) {
+        guard let data = try? JSONSerialization.data(withJSONObject: id, options: .fragmentsAllowed),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webViews[page]!.evaluateJavaScript(
+            "window.dispatchEvent(new CustomEvent('open-item', { detail: { id: \(json) } }));"
+        )
+    }
+
+    /// A question from the page. Each is answered, whatever happens, so the page never waits out
+    /// its timeout for one MacNotes understood.
+    private func answer(_ message: [String: Any]) {
+        guard let id = message["id"] as? String else { return }
+        let reply: (Result<Any, LauncherError>) -> Void = { [weak self] result in
+            self?.reply(id, result)
+        }
+        let password = message["password"] as? String ?? ""
+        switch message["kind"] as? String {
+        case "brain-search":
+            brain.search(message["query"] as? String ?? "") { result in
+                reply(result.map { ["hits": $0] })
+            }
+        case "git-status":
+            DevGit.status(password: password) { reply($0.map { $0 }) }
+        case "git-commit":
+            DevGit.commit(password: password, message: message["message"] as? String ?? "") { reply($0.map { $0 }) }
+        case "clips":
+            reply(.success(["clips": clips.answer]))
+        case let kind:
+            reply(.failure(LauncherError("MacNotes doesn't know \(kind ?? "that")")))
+        }
+    }
+
+    /// Answers request `id` with a "launcher-reply" event: `{id, result}` or `{id, error}`.
+    private func reply(_ id: String, _ result: Result<Any, LauncherError>) {
+        var detail: [String: Any] = ["id": id]
+        switch result {
+        case let .success(value): detail["result"] = value
+        case let .failure(error): detail["error"] = error.message
+        }
+        guard JSONSerialization.isValidJSONObject(detail),
+              let data = try? JSONSerialization.data(withJSONObject: detail),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        launcherView.evaluateJavaScript(
+            "window.dispatchEvent(new CustomEvent('launcher-reply', { detail: \(json) }));"
+        )
     }
 
     private func sendToLauncher(opened: Bool) {
